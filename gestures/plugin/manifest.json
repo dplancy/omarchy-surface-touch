@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "surface-touch.gestures",
+  "name": "Edge gestures",
+  "version": "1.0.0",
+  "author": "omarchy-surface-touch",
+  "description": "Swipe up from the bottom edge for the on-screen keyboard, swipe down from the top left corner for the Omarchy menu.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "EdgeGestures.qml"
+  }
+}

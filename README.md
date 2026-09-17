@@ -220,6 +220,40 @@ Starting the service with `LIGHT_DEBUG=1` logs every decision to the journal.
 
 Remove it with `./light/uninstall.sh`.
 
+## Touch gestures (optional)
+
+Hyprland's own gestures (`hl.gesture`, three fingers and so on) are **trackpad only**. On a
+touchscreen it offers exactly one: swiping in from the left or right edge to change workspace. Turn
+that on in `~/.config/hypr/input.lua`:
+
+```lua
+hl.config({
+  gestures = {
+    workspace_swipe_touch = true,
+    workspace_swipe_distance = 400,
+    workspace_swipe_cancel_ratio = 0.3,
+    workspace_swipe_forever = true,
+  },
+})
+```
+
+`gestures/` adds the two a tablet misses, as thin strips along the edges:
+
+- **Swipe up from the bottom edge**: open or close the on-screen keyboard. The strip steps aside
+  while the keyboard is up, so it never sits on top of it.
+- **Swipe down from the top left corner**: open the Omarchy menu.
+
+```bash
+./gestures/install.sh   # as your user, not with sudo
+```
+
+The strips are 12 px thick and only react to a swipe of at least 40 px, so a tap near an edge still
+reaches the application underneath. They are a shell plugin, installed in
+`~/.config/omarchy/plugins/surface-touch.gestures/`; edit `EdgeGestures.qml` there (or in
+`gestures/plugin/`) to change the thickness, the distance or what the swipes do.
+
+Remove them with `./gestures/uninstall.sh`.
+
 ## Things to know
 
 - **Security.** The IOMMU normally protects memory from buggy or malicious devices. Only the touch
@@ -265,6 +299,7 @@ files/        IOMMU hook, modprobe rule, Omarchy pacman hook
 osk/          optional on-screen keyboard (install.sh, uninstall.sh, daemon, plugin, wvkbd layout)
 rotate/       optional screen rotation (install.sh, uninstall.sh, daemon, bar button)
 light/        optional automatic brightness (install.sh, uninstall.sh, daemon, bar button)
+gestures/     optional edge gestures (install.sh, uninstall.sh, shell plugin)
 ```
 
 ## Credits and license

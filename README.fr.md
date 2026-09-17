@@ -231,6 +231,41 @@ Lancer le service avec `LIGHT_DEBUG=1` trace chaque décision dans le journal.
 
 Désinstallation : `./light/uninstall.sh`.
 
+## Gestes tactiles (optionnel)
+
+Les gestes propres à Hyprland (`hl.gesture`, à trois doigts, etc.) ne fonctionnent **que sur pavé
+tactile**. Sur écran tactile, il n'en offre qu'un : le balayage depuis le bord gauche ou droit pour
+changer de bureau. Il s'active dans `~/.config/hypr/input.lua` :
+
+```lua
+hl.config({
+  gestures = {
+    workspace_swipe_touch = true,
+    workspace_swipe_distance = 400,
+    workspace_swipe_cancel_ratio = 0.3,
+    workspace_swipe_forever = true,
+  },
+})
+```
+
+`gestures/` ajoute les deux qui manquent sur une tablette, sous forme de fines bandes le long des
+bords :
+
+- **Glisser vers le haut depuis le bord bas** : ouvre ou ferme le clavier virtuel. La bande
+  s'efface quand le clavier est ouvert, elle ne se retrouve donc jamais par-dessus.
+- **Glisser vers le bas depuis le coin haut gauche** : ouvre le menu Omarchy.
+
+```bash
+./gestures/install.sh   # en tant qu'utilisateur, pas avec sudo
+```
+
+Les bandes font 12 px d'épaisseur et ne réagissent qu'à un glissement d'au moins 40 px : un appui
+près d'un bord atteint toujours l'application en dessous. C'est un plugin du shell, installé dans
+`~/.config/omarchy/plugins/surface-touch.gestures/` ; modifie `EdgeGestures.qml` (là ou dans
+`gestures/plugin/`) pour changer l'épaisseur, la distance ou l'action des glissements.
+
+Désinstallation : `./gestures/uninstall.sh`.
+
 ## À savoir
 
 - **Sécurité.** L'IOMMU protège normalement la mémoire contre les périphériques défaillants ou
@@ -279,6 +314,7 @@ files/        crochet IOMMU, règle modprobe, crochet pacman Omarchy
 osk/          clavier virtuel optionnel (install.sh, uninstall.sh, service, plugin, disposition wvkbd)
 rotate/       rotation de l'écran optionnelle (install.sh, uninstall.sh, service, bouton de barre)
 light/        luminosité automatique optionnelle (install.sh, uninstall.sh, service, bouton de barre)
+gestures/     gestes de bord optionnels (install.sh, uninstall.sh, plugin du shell)
 ```
 
 ## Crédits et licence
