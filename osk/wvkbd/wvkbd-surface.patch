@@ -1,0 +1,358 @@
+diff --git i/drw.c w/drw.c
+index 89ec8d8..d5a0f55 100644
+--- i/drw.c
++++ w/drw.c
+@@ -155,6 +155,37 @@ drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
+     cairo_restore(d->cairo);
+ }
+ 
++void
++drw_draw_corner_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
++                     uint32_t w, uint32_t h, uint32_t b, bool right,
++                     const char *label, PangoFontDescription *font_description)
++{
++    drwsurf_flip(ds);
++    struct drwbuf *d = ds->back_buffer;
++    drwsurf_damage(ds, x, y, w, h);
++
++    cairo_save(d->cairo);
++
++    pango_layout_set_font_description(d->layout, font_description);
++
++    cairo_set_source_rgba(
++        d->cairo, color.bgra[2] / (double)255, color.bgra[1] / (double)255,
++        color.bgra[0] / (double)255, color.bgra[3] / (double)255);
++
++    pango_layout_set_text(d->layout, label, -1);
++    pango_layout_set_width(d->layout, -1);
++    pango_layout_set_height(d->layout, -1);
++
++    int width, height;
++    pango_layout_get_pixel_size(d->layout, &width, &height);
++
++    uint32_t pad = b + h / 12;
++    cairo_move_to(d->cairo, right ? x + w - pad - width : x + pad, y + pad / 2);
++
++    pango_cairo_show_layout(d->cairo, d->layout);
++    cairo_restore(d->cairo);
++}
++
+ void
+ drw_do_clear(struct drwsurf *ds, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {
+diff --git i/drw.h w/drw.h
+index 060cb00..1f14470 100644
+--- i/drw.h
++++ w/drw.h
+@@ -54,6 +54,11 @@ void drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
+                    uint32_t w, uint32_t h, uint32_t b, const char *label,
+                    PangoFontDescription *font_description);
+ 
++void drw_draw_corner_text(struct drwsurf *ds, Color color, uint32_t x,
++                          uint32_t y, uint32_t w, uint32_t h, uint32_t b,
++                          bool right, const char *label,
++                          PangoFontDescription *font_description);
++
+ uint32_t setup_buffer(struct drwsurf *ds, struct drwbuf *db);
+ 
+ #endif
+diff --git i/keyboard.c w/keyboard.c
+index 8950fd0..2f89d0d 100644
+--- i/keyboard.c
++++ w/keyboard.c
+@@ -10,6 +10,9 @@
+ 
+ #define MAX_LAYERS 25
+ 
++/* two taps on a modifier within this many ms hold it down until it is tapped again */
++#define MOD_DOUBLE_TAP_MS 500
++
+ /* lazy die macro */
+ #define die(...)                                                               \
+     fprintf(stderr, __VA_ARGS__);                                              \
+@@ -52,6 +55,7 @@ kbd_next_layer(struct kbd *kb, struct key *k, bool invert)
+         // with modifiers ctrl/alt/altgr: switch to the first layer
+         layer_index = 0;
+         kb->mods = 0;
++        kb->mods_locked = 0;
+     } else if ((kb->mods & Shift) || (kb->mods & CapsLock) || (invert)) {
+         // with modifiers shift/capslock or invert set: switch to the previous
+         // layout in the layer sequence
+@@ -291,17 +295,32 @@ zwp_virtual_keyboard_v1_key_mods(struct zwp_virtual_keyboard_v1 *vkbd, uint32_t
+         zwp_virtual_keyboard_v1_key(vkbd, time, KEY_RIGHTALT, state);
+ }
+ 
++/* release every modifier the keyboard holds down, so none stays stuck when it goes away */
++void
++kbd_clear_mods(struct kbd *kb, uint32_t time)
++{
++    if (!kb->mods)
++        return;
++    zwp_virtual_keyboard_v1_key_mods(kb->vkbd, time, kb->mods, WL_KEYBOARD_KEY_STATE_RELEASED);
++    kb->mods = 0;
++    kb->mods_locked = 0;
++    zwp_virtual_keyboard_v1_modifiers(kb->vkbd, 0, 0, 0, 0);
++    if (kb->surf)
++        kbd_draw_layout(kb);
++}
++
+ void
+ kbd_unpress_key(struct kbd *kb, uint32_t time)
+ {
+     bool unlatch_shift, unlatch_ctrl, unlatch_alt, unlatch_super, unlatch_altgr, unlatch_tab;
+     unlatch_shift = unlatch_ctrl = unlatch_alt = unlatch_super = unlatch_altgr = unlatch_tab = false;
+     if (kb->last_press) {
+-        unlatch_shift = (kb->mods & Shift) == Shift;
+-        unlatch_ctrl = (kb->mods & Ctrl) == Ctrl;
+-        unlatch_alt = (kb->mods & Alt) == Alt;
+-        unlatch_super = (kb->mods & Super) == Super;
+-        unlatch_altgr = (kb->mods & AltGr) == AltGr;
++        uint8_t latched = kb->mods & ~kb->mods_locked;
++        unlatch_shift = (latched & Shift) == Shift;
++        unlatch_ctrl = (latched & Ctrl) == Ctrl;
++        unlatch_alt = (latched & Alt) == Alt;
++        unlatch_super = (latched & Super) == Super;
++        unlatch_altgr = (latched & AltGr) == AltGr;
+ 
+         if (kb->last_press->type == Copy) {
+             if (kb->debug) fprintf(stderr, "release copy key (unlatch_shift=%d, mods=%d)\n", unlatch_shift, kb->mods);
+@@ -321,6 +340,12 @@ kbd_unpress_key(struct kbd *kb, uint32_t time)
+                                             kb->last_press->code,
+                                             WL_KEYBOARD_KEY_STATE_RELEASED);
+             }
++            if (kb->last_press->code_mod) {
++                zwp_virtual_keyboard_v1_key_mods(kb->vkbd, time,
++                                                 kb->last_press->code_mod & ~kb->mods,
++                                                 WL_KEYBOARD_KEY_STATE_RELEASED);
++                zwp_virtual_keyboard_v1_modifiers(kb->vkbd, kb->mods, 0, 0, 0);
++            }
+         }
+ 
+         if (unlatch_shift) {
+@@ -396,11 +421,13 @@ kbd_motion_key(struct kbd *kb, uint32_t time, uint32_t x, uint32_t y)
+             kb->last_swipe = intersect_key;
+             kbd_draw_key(kb, kb->last_swipe, Swipe);
+         }
+-    } else {
++        kbd_clear_last_popup(kb);
++    } else if (kbd_get_key(kb, x, y) != kb->last_press) {
++        // a finger resting on its key keeps it pressed, so that the key repeats
+         kbd_unpress_key(kb, time);
++        kbd_clear_last_popup(kb);
+     }
+-
+-    kbd_clear_last_popup(kb);
++    return;
+ }
+ 
+ void
+@@ -429,7 +456,7 @@ kbd_press_key(struct kbd *kb, struct key *k, uint32_t time)
+     switch (k->type) {
+     case Code:
+         if (k->code_mod) {
+-            zwp_virtual_keyboard_v1_key_mods(kb->vkbd, time, k->code_mod, WL_KEYBOARD_KEY_STATE_PRESSED);
++            zwp_virtual_keyboard_v1_key_mods(kb->vkbd, time, k->code_mod & ~kb->mods, WL_KEYBOARD_KEY_STATE_PRESSED);
+             if (k->reset_mod) {
+                 zwp_virtual_keyboard_v1_modifiers(kb->vkbd, k->code_mod, 0, 0,
+                                                   0);
+@@ -461,6 +488,20 @@ kbd_press_key(struct kbd *kb, struct key *k, uint32_t time)
+         }
+         break;
+     case Mod:
++        if ((kb->mods & k->code) && !(kb->mods_locked & k->code) && (kb->last_mod == k) &&
++            (time - kb->last_mod_time < MOD_DOUBLE_TAP_MS)) {
++            // second tap: hold the modifier down instead of releasing it
++            kb->mods_locked |= k->code;
++            kb->last_mod = k;
++            kb->last_mod_time = time;
++            if (kb->debug)
++                fprintf(stderr, "mod locked\n");
++            kbd_draw_key(kb, k, Press);
++            break;
++        }
++        kb->last_mod = k;
++        kb->last_mod_time = time;
++        kb->mods_locked &= ~k->code;
+         kb->mods ^= k->code;
+         if (kb->mods & k->code) {
+             if (kb->debug)
+@@ -471,7 +512,7 @@ kbd_press_key(struct kbd *kb, struct key *k, uint32_t time)
+                 fprintf(stderr, "mod released\n");
+             zwp_virtual_keyboard_v1_key_mods(kb->vkbd, time, k->code, WL_KEYBOARD_KEY_STATE_RELEASED);
+         }
+-        if ((k->code == Shift) || (k->code == CapsLock)) {
++        if ((k->code == Shift) || (k->code == CapsLock) || (k->code == AltGr)) {
+             kbd_draw_layout(kb);
+         } else {
+             if (kb->mods & k->code) {
+@@ -626,11 +667,58 @@ kbd_clear_last_popup(struct kbd *kb)
+     }
+ }
+ 
++static const char *
++kbd_key_label(struct key *k, bool shift, bool altgr)
++{
++    if (altgr)
++        return shift ? k->altgr_shift_label : k->altgr_label;
++    return shift ? k->shift_label : k->label;
++}
++
++/* a hint is worth drawing unless it is empty or only a case change */
++static bool
++kbd_hint_useful(const char *hint, const char *label)
++{
++    if (!hint || !*hint || !label)
++        return false;
++    gchar *a = g_utf8_casefold(hint, -1), *b = g_utf8_casefold(label, -1);
++    bool useful = strcmp(a, b) != 0;
++    g_free(a);
++    g_free(b);
++    return useful;
++}
++
++/* draw the characters of the other shift and AltGr levels in the key corners */
++static void
++kbd_draw_hints(struct kbd *kb, struct key *k, const char *label, Color color,
++               bool shift, bool altgr)
++{
++    struct clr_scheme *scheme = &kb->schemes[k->scheme];
++    const char *shift_hint = kbd_key_label(k, !shift, altgr);
++    const char *altgr_hint = kbd_key_label(k, shift, !altgr);
++
++    color.bgra[3] = color.bgra[3] * 3 / 5;
++    if (kbd_hint_useful(shift_hint, label))
++        drw_draw_corner_text(kb->surf, color, k->x, k->y, k->w, k->h,
++                             KBD_KEY_BORDER, false, shift_hint,
++                             scheme->hint_font_description);
++    if (kbd_hint_useful(altgr_hint, label))
++        drw_draw_corner_text(kb->surf, color, k->x, k->y, k->w, k->h,
++                             KBD_KEY_BORDER, true, altgr_hint,
++                             scheme->hint_font_description);
++}
++
+ void
+ kbd_draw_key(struct kbd *kb, struct key *k, enum key_draw_type type)
+ {
+-    const char *label = ((kb->mods & Shift)||((kb->mods & CapsLock) && 
+-        strlen(k->label) == 1 && isalpha(k->label[0]))) ? k->shift_label : k->label;
++    bool shift = (kb->mods & Shift) || ((kb->mods & CapsLock) &&
++        strlen(k->label) == 1 && isalpha(k->label[0]));
++    bool altgr = (kb->mods & AltGr) && k->altgr_label;
++    const char *label = kbd_key_label(k, shift, altgr);
++    if (!label)
++        label = k->label;
++    bool hints = k->type == Code && (k->altgr_label || k->scheme == 0);
++    bool locked = k->type == Mod && (kb->mods_locked & k->code);
+     if (kb->debug)
+         fprintf(stderr, "Draw key +%d+%d %dx%d -> %s\n", k->x, k->y, k->w, k->h,
+                 label);
+@@ -643,6 +731,8 @@ kbd_draw_key(struct kbd *kb, struct key *k, enum key_draw_type type)
+                    scheme->fg, scheme->rounding);
+         drw_draw_text(kb->surf, scheme->text, k->x, k->y, k->w, k->h,
+                   KBD_KEY_BORDER, label, scheme->font_description);
++        if (hints)
++            kbd_draw_hints(kb, k, label, scheme->text, shift, altgr);
+         break;
+     case Press:
+         draw_inset(kb->surf, k->x, k->y, k->w, k->h, KBD_KEY_BORDER,
+@@ -652,6 +742,15 @@ kbd_draw_key(struct kbd *kb, struct key *k, enum key_draw_type type)
+                   kb->show_highlight ? scheme->text_press : scheme->text,
+                   k->x, k->y, k->w, k->h, KBD_KEY_BORDER, label,
+                   scheme->font_description);
++        if (hints)
++            kbd_draw_hints(kb, k, label,
++                           kb->show_highlight ? scheme->text_press : scheme->text,
++                           shift, altgr);
++        if (locked)
++            drw_draw_corner_text(kb->surf,
++                                 kb->show_highlight ? scheme->text_press : scheme->text,
++                                 k->x, k->y, k->w, k->h, KBD_KEY_BORDER, true, "●",
++                                 scheme->hint_font_description);
+         break;
+     case Swipe:
+         draw_over_inset(kb->surf, k->x, k->y, k->w, k->h, KBD_KEY_BORDER,
+diff --git i/keyboard.h w/keyboard.h
+index e39f6cf..f26a9e9 100644
+--- i/keyboard.h
++++ w/keyboard.h
+@@ -59,6 +59,7 @@ struct clr_scheme {
+ 	char *font;
+ 	int rounding;
+ 	PangoFontDescription *font_description;
++	PangoFontDescription *hint_font_description; // corner hints, derived from font
+ };
+ 
+ struct key {
+@@ -77,6 +78,8 @@ struct key {
+ 	const uint32_t code_mod; /* modifier to force when this key is pressed */
+ 	uint8_t scheme;          // index of the scheme to use
+ 	bool reset_mod;          /* reset modifiers when clicked */
++	const char *altgr_label;       // label with AltGr (optional)
++	const char *altgr_shift_label; // label with Shift+AltGr (optional)
+ 
+ 	// actual coordinates on the surface (pixels), will be computed automatically
+ 	// for all keys
+@@ -108,6 +111,9 @@ struct kbd {
+ 	bool shift_space_is_tab;
+ 	bool exclusive;
+ 	uint8_t mods;
++	uint8_t mods_locked;      /* modifiers held by a double tap, until tapped again */
++	struct key *last_mod;     /* last modifier key pressed, to catch double taps */
++	uint32_t last_mod_time;
+ 	uint8_t compose;
+ 	struct key *last_press;
+ 	struct key *last_swipe;
+@@ -150,6 +156,7 @@ void kbd_draw_layout(struct kbd *kb);
+ void kbd_resize(struct kbd *kb, struct layout *layouts, uint8_t layoutcount);
+ uint8_t kbd_get_rows(struct layout *l);
+ double kbd_get_row_length(struct key *k);
++void kbd_clear_mods(struct kbd *kb, uint32_t time);
+ void kbd_next_layer(struct kbd *kb, struct key *k, bool invert);
+ void kbd_switch_layout(struct kbd *kb, struct layout *l, size_t layer_index);
+ 
+diff --git i/main.c w/main.c
+index 765abda..9d9ab2b 100644
+--- i/main.c
++++ w/main.c
+@@ -723,6 +723,8 @@ hide()
+         return;
+     }
+ 
++    kbd_clear_mods(&keyboard, 0);
++
+     if (wfs_draw_surf) {
+         wp_fractional_scale_v1_destroy(wfs_draw_surf);
+         wfs_draw_surf = NULL;
+@@ -1149,6 +1151,11 @@ main(int argc, char **argv)
+     for (i = 0; i < countof(schemes); i++) {
+         schemes[i].font_description =
+             pango_font_description_from_string(schemes[i].font);
++        schemes[i].hint_font_description =
++            pango_font_description_copy(schemes[i].font_description);
++        pango_font_description_set_size(
++            schemes[i].hint_font_description,
++            pango_font_description_get_size(schemes[i].font_description) * 11 / 20);
+     }
+ 
+     if (!hidden)
+@@ -1171,6 +1178,8 @@ main(int argc, char **argv)
+     sigaddset(&signal_mask, SIGUSR2);
+     sigaddset(&signal_mask, SIGRTMIN);
+     sigaddset(&signal_mask, SIGPIPE);
++    sigaddset(&signal_mask, SIGTERM);
++    sigaddset(&signal_mask, SIGINT);
+     if (sigprocmask(SIG_BLOCK, &signal_mask, NULL) == -1) {
+         die("Failed to disable handled signals: %d\n", errno);
+     }
+@@ -1206,6 +1215,11 @@ main(int argc, char **argv)
+                 toggle_visibility();
+             else if (si.ssi_signo == SIGPIPE)
+                 pipewarn();
++            else if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT) {
++                kbd_clear_mods(&keyboard, 0);
++                wl_display_flush(display);
++                return 0;
++            }
+         }
+     }
+ 

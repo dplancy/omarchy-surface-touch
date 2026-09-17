@@ -1,0 +1,15 @@
+[Unit]
+Description=On-screen keyboard for Surface tablets (omarchy-surface-touch)
+# fcitx5 reports focused text fields to this service
+After=graphical-session.target omarchy-fcitx5.service
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/omarchy-surface-osk/omarchy-surface-osk daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

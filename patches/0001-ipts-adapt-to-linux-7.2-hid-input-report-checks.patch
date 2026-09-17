@@ -1,0 +1,73 @@
+# Adapts the IPTS driver from linux-surface (patches/6.19/0005-ipts.patch)
+# to the stricter HID input report checks of Linux 7.2.
+# Applies on top of drivers/hid/ipts/ from that patch.
+
+diff -ru a/drivers/hid/ipts/hid.c b/drivers/hid/ipts/hid.c
+--- a/drivers/hid/ipts/hid.c
++++ b/drivers/hid/ipts/hid.c
+@@ -114,6 +114,20 @@
+ 	.raw_request = ipts_hid_raw_request,
+ };
+ 
++/*
++ * Linux 7.2 rejects input reports that are shorter than their descriptor unless it
++ * knows the real buffer size and can pad them. The Makefile detects whether the kernel
++ * has hid_safe_input_report(), so the module still builds on older kernels.
++ */
++static int ipts_hid_input_report(struct ipts_context *ipts, u8 *data, size_t bufsize, u32 size)
++{
++#ifdef IPTS_HAVE_HID_SAFE_INPUT_REPORT
++	return hid_safe_input_report(ipts->hid, HID_INPUT_REPORT, data, bufsize, size, 1);
++#else
++	return hid_input_report(ipts->hid, HID_INPUT_REPORT, data, size, 1);
++#endif
++}
++
+ int ipts_hid_input_data(struct ipts_context *ipts, u32 buffer)
+ {
+ 	u8 *temp = NULL;
+@@ -141,7 +155,9 @@
+ 		return 0;
+ 
+ 	if (header->type == IPTS_DATA_TYPE_HID)
+-		return hid_input_report(ipts->hid, HID_INPUT_REPORT, header->data, header->size, 1);
++		return ipts_hid_input_report(ipts, header->data,
++					     ipts->resources.data[buffer].size - sizeof(*header),
++					     header->size);
+ 
+ 	if (header->type == IPTS_DATA_TYPE_GET_FEATURES) {
+ 		ipts->feature_report.address = header->data;
+@@ -168,7 +184,8 @@
+ 
+ 	memcpy(frame->data, header->data, header->size);
+ 
+-	return hid_input_report(ipts->hid, HID_INPUT_REPORT, temp, IPTS_HID_REPORT_DATA_SIZE, 1);
++	return ipts_hid_input_report(ipts, temp, ipts->resources.report.size,
++				     IPTS_HID_REPORT_DATA_SIZE);
+ }
+ 
+ int ipts_hid_init(struct ipts_context *ipts, struct ipts_device_info info)
+diff -ru a/drivers/hid/ipts/resources.c b/drivers/hid/ipts/resources.c
+--- a/drivers/hid/ipts/resources.c
++++ b/drivers/hid/ipts/resources.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/hid.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ 
+@@ -88,7 +89,11 @@
+ 		goto err;
+ 
+ 	if (!res->report.address) {
+-		res->report.size = IPTS_HID_REPORT_DATA_SIZE;
++		/*
++		 * Linux 7.2 rejects reports shorter than the descriptor unless the
++		 * buffer is large enough to be padded, so allocate the HID maximum.
++		 */
++		res->report.size = HID_MAX_BUFFER_SIZE;
+ 		res->report.address = kzalloc(res->report.size, GFP_KERNEL);
+ 
+ 		if (!res->report.address) {

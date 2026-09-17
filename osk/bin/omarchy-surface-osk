@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""On-screen keyboard for Surface tablets on Omarchy.
+
+The daemon registers as the fcitx5 virtual keyboard UI, so fcitx5 tells it when
+a text field gains or loses focus. When no physical keyboard is attached, a small
+keyboard icon is offered (drawn by the omarchy-shell plugin, which reads the
+state file); tapping it opens wvkbd. On the lock screen the keyboard opens
+directly.
+
+Usage:
+  omarchy-surface-osk daemon
+  omarchy-surface-osk show|hide|toggle|status
+  omarchy-surface-osk layout [azerty|qwerty|toggle]
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+
+import warnings
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+APP = "omarchy-surface-osk"
+BUS_NAME = "local.omarchy_surface_touch.Osk"
+BUS_PATH = "/local/omarchy_surface_touch/Osk"
+BUS_IFACE = "local.omarchy_surface_touch.Osk1"
+
+FCITX_NAME = "org.fcitx.Fcitx5"
+FCITX_VK_PATH = "/virtualkeyboard"
+FCITX_VK_IFACE = "org.fcitx.Fcitx.VirtualKeyboard1"
+FCITX_CTRL_PATH = "/controller"
+FCITX_CTRL_IFACE = "org.fcitx.Fcitx.Controller1"
+FCITX_VK_UI = "virtualkeyboard"
+VK_UI_NAME = "org.fcitx.Fcitx5.VirtualKeyboard"
+VK_UI_PATH = "/org/fcitx/virtualkeyboard/impanel"
+VK_UI_IFACE = "org.fcitx.Fcitx5.VirtualKeyboard1"
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+
+DEFAULT_CONFIG = {
+    # "azerty" or "qwerty"
+    "layout": "azerty",
+    # keyboard height in logical pixels, portrait and landscape
+    "height": 300,
+    "landscape_height": 280,
+    # hide the keyboard when the focused text field goes away
+    "hide_on_blur": True,
+    # keyboards matching this regex (udev name) do not count as physical keyboards
+    "ignore_keyboards": "",
+}
+
+# fcitx5 sends Hide then Show when focus moves between two fields
+FOCUS_DEBOUNCE_MS = 250
+# wvkbd layer shown by the "123" key, per layout
+SYMBOL_LAYERS = {"azerty": "symboles", "qwerty": "symbols"}
+# typing through wvkbd switches fcitx5 back to physical keyboard mode
+REARM_AFTER_TYPING_MS = 800
+# wvkbd blocks its signals only once initialized, an early SIGUSR2 would kill it
+KEYBOARD_STARTUP_MS = 500
+
+
+DEBUG = bool(os.environ.get("OSK_DEBUG"))
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        log(msg)
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE) as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"ignoring invalid {CONFIG_FILE}: {e}")
+    if config["layout"] not in ("azerty", "qwerty"):
+        config["layout"] = DEFAULT_CONFIG["layout"]
+    return config
+
+
+def save_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def theme_colors():
+    """wvkbd color arguments from the current Omarchy theme."""
+    try:
+        with open(THEME_COLORS, "rb") as f:
+            colors = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+    def hex_(key, fallback):
+        value = str(colors.get(key, fallback)).lstrip("#")
+        return value if re.fullmatch(r"[0-9a-fA-F]{6}", value) else fallback.lstrip("#")
+
+    bg = hex_("darker_background", hex_("background", "1a1b26"))
+    key = hex_("lighter_background", hex_("background", "24283b"))
+    special = hex_("background", "1a1b26")
+    text = hex_("foreground", "a9b1d6")
+    accent = hex_("accent", "7aa2f7")
+    return ["--bg", bg, "--fg", key, "--fg-sp", special, "--press", accent, "--press-sp", accent,
+            "--text", text, "--text-sp", text]
+
+
+class PhysicalKeyboards:
+    """Tracks whether a physical keyboard (e.g. the Type Cover) is attached."""
+
+    def __init__(self, ignore_regex, on_change):
+        warnings.filterwarnings("ignore", message="Will be removed in 1.0")
+        import pyudev
+
+        self.ignore = re.compile(ignore_regex) if ignore_regex else None
+        self.on_change = on_change
+        self.context = pyudev.Context()
+        self.present = self.scan()
+        self.monitor = pyudev.Monitor.from_netlink(self.context)
+        self.monitor.filter_by("input")
+        self.monitor.start()
+        GLib.io_add_watch(self.monitor.fileno(), GLib.IO_IN, self.on_udev)
+
+    def scan(self):
+        for device in self.context.list_devices(subsystem="input", ID_INPUT_KEYBOARD="1"):
+            if not (device.device_node or "").startswith("/dev/input/event"):
+                continue
+            name = device.parent.properties.get("NAME", "").strip('"') if device.parent else ""
+            if self.ignore and self.ignore.search(name):
+                continue
+            return True
+        return False
+
+    def on_udev(self, *_):
+        while self.monitor.poll(timeout=0):
+            pass
+        present = self.scan()
+        if present != self.present:
+            self.present = present
+            self.on_change(present)
+        return True
+
+
+class Keyboard:
+    """The wvkbd process, started hidden and shown with signals."""
+
+    def __init__(self, config, on_key):
+        self.config = config
+        self.on_key = on_key
+        self.proc = None
+        self.started_at = 0.0
+        self.visible = False
+        self.colors_mtime = None
+
+    def binary(self):
+        # ~/.local/bin/omarchy-surface-osk is a symlink: the keyboard sits next to the real file
+        return os.path.join(os.path.dirname(os.path.realpath(__file__)), "wvkbd-surface")
+
+    def start(self):
+        self.stop()
+        layers = f"{self.config['layout']},{SYMBOL_LAYERS[self.config['layout']]}"
+        cmd = ["stdbuf", "-oL", self.binary(), "--hidden", "-o", "-l", layers, "--landscape-layers", layers,
+               "-H", str(self.config["height"]), "-L", str(self.config["landscape_height"])]
+        cmd += theme_colors()
+        self.colors_mtime = self.theme_mtime()
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log(f"cannot start {self.binary()}: {e}")
+            self.proc = None
+            return
+        self.started_at = time.monotonic()
+        # wvkbd prints one character per key, without a newline: read raw bytes, never a line
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        GLib.io_add_watch(self.proc.stdout.fileno(), GLib.IO_IN | GLib.IO_HUP, self.on_output, self.proc)
+        self.visible = False
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+        self.visible = False
+
+    @staticmethod
+    def theme_mtime():
+        try:
+            return os.stat(THEME_COLORS).st_mtime
+        except OSError:
+            return None
+
+    def ensure_running(self):
+        if self.proc is None or self.proc.poll() is not None or self.theme_mtime() != self.colors_mtime:
+            self.start()
+
+    def show(self):
+        self.ensure_running()
+        self.visible = True
+        wait_ms = int(KEYBOARD_STARTUP_MS - (time.monotonic() - self.started_at) * 1000)
+        if wait_ms > 0:
+            GLib.timeout_add(wait_ms, self.send_show, self.proc)
+        else:
+            self.send_show(self.proc)
+
+    def send_show(self, proc):
+        if proc is self.proc and self.visible and proc.poll() is None:
+            proc.send_signal(signal.SIGUSR2)
+        return False
+
+    def hide(self):
+        if self.visible and self.proc and self.proc.poll() is None:
+            if (time.monotonic() - self.started_at) * 1000 >= KEYBOARD_STARTUP_MS:
+                self.proc.send_signal(signal.SIGUSR1)
+        self.visible = False
+
+    def on_output(self, fd, condition, proc):
+        if proc is not self.proc:
+            return False
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:  # the process is gone
+            return False
+        debug(f"typed {data!r}")
+        self.on_key()
+        return True
+
+
+class FcitxVirtualKeyboardUI(dbus.service.Object):
+    """The org.fcitx.Fcitx5.VirtualKeyboard1 interface fcitx5 calls into."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, VK_UI_PATH)
+        self.daemon = daemon
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="", out_signature="")
+    def ShowVirtualKeyboard(self):
+        self.daemon.on_fcitx_focus(True)
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="", out_signature="")
+    def HideVirtualKeyboard(self):
+        self.daemon.on_fcitx_focus(False)
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="s", out_signature="")
+    def NotifyIMActivated(self, name):
+        pass
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="s", out_signature="")
+    def NotifyIMDeactivated(self, name):
+        pass
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="", out_signature="")
+    def NotifyIMListChanged(self):
+        pass
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="asbbii", out_signature="")
+    def UpdateCandidateArea(self, candidates, has_prev, has_next, page, cursor):
+        pass
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="s", out_signature="")
+    def UpdatePreeditArea(self, text):
+        pass
+
+    @dbus.service.method(VK_UI_IFACE, in_signature="i", out_signature="")
+    def UpdatePreeditCaret(self, index):
+        pass
+
+
+class Control(dbus.service.Object):
+    """Commands from the CLI and the shell plugin."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, BUS_PATH)
+        self.daemon = daemon
+
+    @dbus.service.method(BUS_IFACE, in_signature="s", out_signature="s")
+    def Command(self, command):
+        return self.daemon.command(command)
+
+
+class Daemon:
+    def __init__(self):
+        self.config = load_config()
+        self.bus = dbus.SessionBus()
+        self.focused = False
+        self.locked = False
+        self.ignore_fcitx_until = 0.0
+        self.armed = False
+        self.focus_timer = None
+        self.rearm_timer = None
+
+        self.keyboard = Keyboard(self.config, self.on_key_typed)
+        self.physical = PhysicalKeyboards(self.config["ignore_keyboards"], self.on_physical_keyboard)
+
+        self.control_name = dbus.service.BusName(BUS_NAME, self.bus, do_not_queue=True)
+        self.control = Control(self.bus, self)
+        self.vk_name = dbus.service.BusName(VK_UI_NAME, self.bus, do_not_queue=True)
+        self.vk_ui = FcitxVirtualKeyboardUI(self.bus, self)
+        self.bus.watch_name_owner(FCITX_NAME, self.on_fcitx_owner)
+
+        self.keyboard.start()
+        self.arm()
+        self.publish()
+
+    # -- fcitx5 --------------------------------------------------------------
+
+    def arm(self):
+        """Put fcitx5 in on-screen keyboard mode so it reports text focus to us."""
+        debug("arming fcitx5")
+        if self.physical.present:
+            return
+        self.ignore_fcitx_until = time.monotonic() + 0.5
+        self.armed = True
+        for method in ("ShowVirtualKeyboard", "HideVirtualKeyboard"):
+            try:
+                self.bus.call_async(FCITX_NAME, FCITX_VK_PATH, FCITX_VK_IFACE, method, "", (),
+                                    None, lambda e: log(f"fcitx5: {e}"))
+            except dbus.DBusException as e:
+                log(f"fcitx5 not reachable: {e}")
+                return
+
+    def on_fcitx_owner(self, owner):
+        if owner:
+            GLib.timeout_add(1000, lambda: self.arm() and False)
+
+    def on_fcitx_focus(self, focused):
+        debug(f"fcitx focus {focused}"
+              f"{' (ignored)' if time.monotonic() < self.ignore_fcitx_until else ''}")
+        if time.monotonic() < self.ignore_fcitx_until:
+            return
+        if self.focus_timer:
+            GLib.source_remove(self.focus_timer)
+        self.focus_timer = GLib.timeout_add(FOCUS_DEBOUNCE_MS, self.apply_focus, focused)
+
+    def apply_focus(self, focused):
+        self.focus_timer = None
+        debug(f"apply focus {focused}, visible {self.keyboard.visible}")
+        if not focused and self.keyboard.visible:
+            # fcitx5 leaves keyboard mode as soon as a key is pressed (even a modifier) and then
+            # asks us to hide: a hide is only about focus while it is still in keyboard mode
+            self.current_ui(lambda ui: self.set_focus(focused) if ui == FCITX_VK_UI else self.arm())
+            return False
+        self.set_focus(focused)
+        return False
+
+    def current_ui(self, done):
+        """Ask fcitx5 which UI it currently uses, without blocking."""
+        try:
+            self.bus.call_async(FCITX_NAME, FCITX_CTRL_PATH, FCITX_CTRL_IFACE, "CurrentUI", "", (),
+                                lambda ui: done(str(ui)), lambda e: done(""))
+        except dbus.DBusException as e:
+            log(f"fcitx5 not reachable: {e}")
+            done("")
+
+    def set_focus(self, focused):
+        self.focused = focused
+        if self.physical.present:
+            self.publish()
+            return
+
+        was_locked = self.locked
+        self.locked = self.session_locked()
+        if focused and self.locked:
+            # no icon on the lock screen, the password field needs the keyboard
+            self.keyboard.show()
+        elif self.keyboard.visible and ((not focused and self.config["hide_on_blur"]) or was_locked != self.locked):
+            self.keyboard.hide()
+        self.publish()
+
+    def on_key_typed(self):
+        if self.rearm_timer:
+            GLib.source_remove(self.rearm_timer)
+        self.rearm_timer = GLib.timeout_add(REARM_AFTER_TYPING_MS, self.rearm_after_typing)
+
+    def rearm_after_typing(self):
+        self.rearm_timer = None
+        self.arm()
+        return False
+
+    def restore_fcitx(self):
+        """fcitx5 only leaves on-screen keyboard mode through its virtual keyboard UI, which
+        goes away with us: restart it so its normal UI comes back. Skipped at logout."""
+        if not self.armed:
+            return
+        session = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "graphical-session.target"])
+        if session.returncode == 0:
+            subprocess.run(["systemctl", "--user", "try-restart", "--no-block", "omarchy-fcitx5.service"])
+
+    # -- physical keyboard and lock screen -------------------------------------
+
+    def on_physical_keyboard(self, present):
+        log(f"physical keyboard {'attached' if present else 'detached'}")
+        if present:
+            self.keyboard.hide()
+        else:
+            self.arm()
+        self.publish()
+
+    @staticmethod
+    def session_locked():
+        try:
+            out = subprocess.run(["omarchy-shell", "lock", "isLocked"], capture_output=True,
+                                 text=True, timeout=3).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return out == "true"
+
+    # -- commands and state ----------------------------------------------------
+
+    def command(self, command):
+        parts = command.split()
+        if not parts:
+            return "error: empty command"
+        action, args = parts[0], parts[1:]
+        if action == "show":
+            self.keyboard.show()
+        elif action == "hide":
+            self.keyboard.hide()
+            self.arm()
+        elif action == "toggle":
+            if self.keyboard.visible:
+                self.keyboard.hide()
+                self.arm()
+            else:
+                self.keyboard.show()
+        elif action == "layout":
+            wanted = args[0] if args else "toggle"
+            if wanted == "toggle":
+                wanted = "qwerty" if self.config["layout"] == "azerty" else "azerty"
+            if wanted not in ("azerty", "qwerty"):
+                return "error: layout must be azerty, qwerty or toggle"
+            was_visible = self.keyboard.visible
+            self.config["layout"] = wanted
+            save_config(self.config)
+            self.keyboard.start()
+            if was_visible:
+                self.keyboard.show()
+        elif action != "status":
+            return f"error: unknown command {action}"
+        self.publish()
+        return json.dumps(self.state())
+
+    def state(self):
+        return {
+            "physicalKeyboard": self.physical.present,
+            "focused": self.focused,
+            "locked": self.locked,
+            "visible": self.keyboard.visible,
+            "layout": self.config["layout"],
+            "height": self.config["height"],
+            "landscapeHeight": self.config["landscape_height"],
+        }
+
+    def publish(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state(), f)
+        os.replace(tmp, STATE_FILE)
+
+
+def run_daemon():
+    DBusGMainLoop(set_as_default=True)
+    try:
+        daemon = Daemon()
+    except dbus.exceptions.NameExistsException:
+        sys.exit(f"{APP}: already running, or another virtual keyboard is registered with fcitx5")
+    loop = GLib.MainLoop()
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:
+        signal_add = GLib.unix_signal_add
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    loop.run()
+    daemon.keyboard.stop()
+    daemon.restore_fcitx()
+
+
+def run_command(command):
+    try:
+        proxy = dbus.SessionBus().get_object(BUS_NAME, BUS_PATH)
+        result = proxy.Command(command, dbus_interface=BUS_IFACE)
+    except dbus.DBusException:
+        sys.exit(f"{APP}: the daemon is not running (systemctl --user start {APP})")
+    print(result)
+    sys.exit(1 if result.startswith("error") else 0)
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["daemon"]:
+        run_daemon()
+    elif args and args[0] in ("show", "hide", "toggle", "status", "layout"):
+        run_command(" ".join(args))
+    else:
+        print(__doc__.strip())
+        sys.exit(0 if args in ([], ["-h"], ["--help"]) else 1)
+
+
+main()

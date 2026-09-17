@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "surface-touch.osk",
+  "name": "On-screen keyboard",
+  "version": "1.0.0",
+  "author": "omarchy-surface-touch",
+  "description": "Keyboard icon for touch devices: appears on text fields when no physical keyboard is attached, opens the omarchy-surface-osk keyboard.",
+  "kinds": [
+    "panel",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "IconPanel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "On-screen keyboard",
+    "description": "Opens the on-screen keyboard when no physical keyboard is attached",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

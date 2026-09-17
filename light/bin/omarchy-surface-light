@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Automatic screen brightness for Surface tablets on Omarchy.
+
+The daemon reads the ambient light sensor (iio als, no root and no
+iio-sensor-proxy needed) and follows it with the backlight. Setting the
+brightness by hand wins: the daemon then keeps quiet until the light around you
+really changes.
+
+Usage:
+  omarchy-surface-light daemon
+  omarchy-surface-light status|toggle|enable|disable
+  omarchy-surface-light sensor      (print what the light sensor reports)
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+APP = "omarchy-surface-light"
+BUS_NAME = "local.omarchy_surface_touch.Light"
+BUS_PATH = "/local/omarchy_surface_touch/Light"
+BUS_IFACE = "local.omarchy_surface_touch.Light1"
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+IIO_DEVICES = "/sys/bus/iio/devices"
+BACKLIGHTS = "/sys/class/backlight"
+
+DEFAULT_CONFIG = {
+    # backlight to drive, empty means the first one in /sys/class/backlight
+    "device": "",
+    # brightness (%) to use at a given light level (lux), interpolated in between
+    "curve": [[0, 5], [5, 15], [20, 30], [50, 45], [150, 58], [500, 72], [1500, 85], [5000, 95], [20000, 100]],
+    # brightness added to the whole curve, to taste (%)
+    "bias": 0,
+    # never go below or above these (%)
+    "min_percent": 5,
+    "max_percent": 100,
+    # how often the sensor is read (ms)
+    "poll_ms": 500,
+    # smoothing of the light readings, 0 (very slow) to 1 (no smoothing)
+    "smoothing": 0.25,
+    # the light has to change by this factor for a big jump to be followed at once
+    "jump_ratio": 3.0,
+    # brightness moves at most this much per reading (%)
+    "step_percent": 4,
+    # brightness is left alone while it is this close to the target (%)
+    "deadband_percent": 3,
+    # after you set the brightness yourself, the light has to change by this factor
+    # before the daemon takes over again
+    "resume_ratio": 2.0,
+}
+
+DEBUG = bool(os.environ.get("LIGHT_DEBUG"))
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        log(msg)
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE) as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"ignoring invalid {CONFIG_FILE}: {e}")
+    curve = [p for p in config["curve"] if isinstance(p, (list, tuple)) and len(p) == 2]
+    config["curve"] = sorted(curve) or DEFAULT_CONFIG["curve"]
+    return config
+
+
+class LightSensor:
+    """The iio als device, read through sysfs."""
+
+    def __init__(self):
+        self.path = self.find()
+        self.scale = self.read_float("in_illuminance_scale", 1.0) or 1.0
+
+    @staticmethod
+    def find():
+        try:
+            devices = sorted(os.listdir(IIO_DEVICES))
+        except OSError:
+            return None
+        for device in devices:
+            path = os.path.join(IIO_DEVICES, device)
+            try:
+                with open(os.path.join(path, "name")) as f:
+                    name = f.read().strip()
+            except OSError:
+                continue
+            if name == "als" and os.path.exists(os.path.join(path, "in_illuminance_raw")):
+                return path
+        return None
+
+    def read_float(self, name, fallback=0.0):
+        try:
+            with open(os.path.join(self.path, name)) as f:
+                return float(f.read().strip())
+        except (OSError, TypeError, ValueError):
+            return fallback
+
+    def lux(self):
+        if not self.path:
+            return None
+        raw = self.read_float("in_illuminance_raw", None)
+        return None if raw is None else raw * self.scale
+
+
+class Backlight:
+    """The backlight, driven through brightnessctl (no root needed)."""
+
+    def __init__(self, device):
+        self.device = device or self.find()
+        self.max = self.read("max_brightness") or 1
+
+    @staticmethod
+    def find():
+        try:
+            devices = sorted(os.listdir(BACKLIGHTS))
+        except OSError:
+            return None
+        # a raw backlight drives the panel itself; acpi_video0 often does nothing
+        for device in devices:
+            try:
+                with open(os.path.join(BACKLIGHTS, device, "type")) as f:
+                    if f.read().strip() == "raw":
+                        return device
+            except OSError:
+                continue
+        return devices[0] if devices else None
+
+    def read(self, name):
+        try:
+            with open(os.path.join(BACKLIGHTS, self.device, name)) as f:
+                return int(f.read().strip())
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def percent(self):
+        raw = self.read("brightness")
+        return None if raw is None else round(raw * 100 / self.max)
+
+    def set_percent(self, percent):
+        try:
+            done = subprocess.run(["brightnessctl", "-q", "-d", self.device, "set", f"{percent}%"],
+                                  capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"brightnessctl failed: {e}")
+            return None
+        if done.returncode != 0:
+            log(f"brightnessctl could not set {self.device} to {percent}%: "
+                f"{done.stderr.strip() or f'exit {done.returncode}'}")
+            return None
+        return self.percent()
+
+
+def brightness_for(lux, config):
+    """Brightness (%) the curve asks for at this light level."""
+    curve = config["curve"]
+    percent = curve[-1][1]
+    if lux <= curve[0][0]:
+        percent = curve[0][1]
+    else:
+        for (lux_a, percent_a), (lux_b, percent_b) in zip(curve, curve[1:]):
+            if lux <= lux_b:
+                # interpolate on a log scale, the way the eye takes light
+                span = math.log10(lux_b + 1) - math.log10(lux_a + 1)
+                position = (math.log10(lux + 1) - math.log10(lux_a + 1)) / span if span else 0
+                percent = percent_a + position * (percent_b - percent_a)
+                break
+    return int(round(min(config["max_percent"], max(config["min_percent"], percent + config["bias"]))))
+
+
+class Control(dbus.service.Object):
+    """Commands from the CLI and the shell plugin."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, BUS_PATH)
+        self.daemon = daemon
+
+    @dbus.service.method(BUS_IFACE, in_signature="s", out_signature="s")
+    def Command(self, command):
+        return self.daemon.command(command)
+
+
+class Daemon:
+    def __init__(self):
+        self.config = load_config()
+        self.bus = dbus.SessionBus()
+        self.sensor = LightSensor()
+        self.backlight = Backlight(self.config["device"])
+        self.enabled = True
+        self.lux = self.sensor.lux()
+        self.applied = None   # the brightness we set ourselves
+        self.paused_at = None  # light level when the brightness was set by hand
+
+        if not self.sensor.path:
+            log("no als sensor found, nothing to follow")
+        if not self.backlight.device:
+            log("no backlight found")
+
+        self.name = dbus.service.BusName(BUS_NAME, self.bus, do_not_queue=True)
+        self.control = Control(self.bus, self)
+
+        GLib.timeout_add(self.config["poll_ms"], self.poll)
+        self.publish()
+
+    # -- following the light ---------------------------------------------------
+
+    def poll(self):
+        reading = self.sensor.lux()
+        if reading is None:
+            return True
+        if self.lux is None:
+            self.lux = reading
+        elif reading > self.lux * self.config["jump_ratio"] or reading * self.config["jump_ratio"] < self.lux:
+            self.lux = reading  # walking into the sun or into the dark: follow at once
+        else:
+            alpha = self.config["smoothing"]
+            self.lux = alpha * reading + (1 - alpha) * self.lux
+
+        if not self.enabled or not self.backlight.device:
+            return True
+
+        current = self.backlight.percent()
+        if current is None:
+            return True
+        if self.applied is not None and abs(current - self.applied) > 1:
+            # somebody else moved the brightness: leave it alone until the light changes
+            debug(f"brightness set by hand ({self.applied}% -> {current}%)")
+            self.paused_at = self.lux
+            self.applied = None
+            self.publish()
+            return True
+        if self.paused_at is not None:
+            ratio = self.config["resume_ratio"]
+            if max(self.lux, 1) < max(self.paused_at, 1) * ratio and max(self.lux, 1) * ratio > max(self.paused_at, 1):
+                return True
+            debug(f"light changed ({self.paused_at:.0f} -> {self.lux:.0f} lux), following again")
+            self.paused_at = None
+
+        target = brightness_for(self.lux, self.config)
+        if abs(target - current) < self.config["deadband_percent"]:
+            self.applied = self.applied if self.applied is not None else current
+            return True
+        step = self.config["step_percent"]
+        nearer = current + max(-step, min(step, target - current))
+        applied = self.backlight.set_percent(nearer)
+        self.applied = nearer if applied is None else applied
+        self.publish()
+        return True
+
+    # -- commands and state ----------------------------------------------------
+
+    def command(self, command):
+        action = command.strip()
+        if action == "toggle":
+            self.enabled = not self.enabled
+        elif action == "enable":
+            self.enabled = True
+        elif action == "disable":
+            self.enabled = False
+        elif action != "status":
+            return f"error: unknown command {action}"
+        if action in ("toggle", "enable") and self.enabled:
+            self.paused_at = None
+            self.applied = None
+        self.publish()
+        return json.dumps(self.state())
+
+    def state(self):
+        return {
+            "enabled": self.enabled,
+            "paused": self.paused_at is not None,
+            "lux": round(self.lux) if self.lux is not None else None,
+            "percent": self.backlight.percent(),
+            "sensor": bool(self.sensor.path),
+        }
+
+    def publish(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state(), f)
+        os.replace(tmp, STATE_FILE)
+
+
+def run_daemon():
+    DBusGMainLoop(set_as_default=True)
+    try:
+        Daemon()
+    except dbus.exceptions.NameExistsException:
+        sys.exit(f"{APP}: already running")
+    loop = GLib.MainLoop()
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:
+        signal_add = GLib.unix_signal_add
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    loop.run()
+
+
+def run_command(command):
+    try:
+        proxy = dbus.SessionBus().get_object(BUS_NAME, BUS_PATH)
+        result = proxy.Command(command, dbus_interface=BUS_IFACE)
+    except dbus.DBusException:
+        sys.exit(f"{APP}: the daemon is not running (systemctl --user start {APP})")
+    print(result)
+    sys.exit(1 if result.startswith("error") else 0)
+
+
+def run_sensor():
+    """Print the light level and the brightness the curve asks for."""
+    sensor = LightSensor()
+    if not sensor.path:
+        sys.exit(f"{APP}: no als sensor found")
+    config = load_config()
+    backlight = Backlight(config["device"])
+    print(f"{sensor.path} (scale {sensor.scale})")
+    while True:
+        lux = sensor.lux()
+        if lux is not None:
+            print(f"{lux:8.0f} lux  -> {brightness_for(lux, config):3d}%   "
+                  f"(now {backlight.percent()}%)", flush=True)
+        GLib.usleep(500000)
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["daemon"]:
+        run_daemon()
+    elif args == ["sensor"]:
+        run_sensor()
+    elif args and args[0] in ("status", "toggle", "enable", "disable"):
+        run_command(args[0])
+    else:
+        print(__doc__.strip())
+        sys.exit(0 if args in ([], ["-h"], ["--help"]) else 1)
+
+
+main()

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Omarchy hook: `omarchy refresh pacman` rewrites /etc/pacman.conf from a template,
+# which drops the linux-surface repository that provides iptsd. Add it back.
+# Installed by omarchy-surface-touch into ~/.config/omarchy/hooks/pre-refresh-pacman.d/
+
+CONF=/etc/pacman.conf
+
+grep -q '^\[linux-surface\]' "$CONF" && exit 0
+
+printf '\n[linux-surface]\nServer = https://pkg.surfacelinux.com/arch/\n' | sudo tee -a "$CONF" >/dev/null

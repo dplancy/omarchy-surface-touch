@@ -1,0 +1,15 @@
+[Unit]
+Description=Automatic screen rotation for Surface tablets (omarchy-surface-touch)
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+ConditionPathExists=/sys/bus/iio/devices
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/omarchy-surface-rotate/omarchy-surface-rotate daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

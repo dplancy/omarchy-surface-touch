@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "surface-touch.light",
+  "name": "Automatic brightness",
+  "version": "1.0.0",
+  "author": "omarchy-surface-touch",
+  "description": "Bar button for automatic brightness: follow the ambient light sensor, or leave the brightness alone.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Automatic brightness",
+    "description": "Turns automatic brightness on or off",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

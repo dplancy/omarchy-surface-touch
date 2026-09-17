@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Screen rotation for Surface tablets on Omarchy.
+
+The daemon reads the HID accelerometer (iio accel_3d, no root and no
+iio-sensor-proxy needed) and turns the screen to match how the tablet is held.
+Rotation is suspended while a physical keyboard is attached (laptop mode); the
+bar button turns it back on when you want it anyway, and locks it when you do
+not.
+
+Usage:
+  omarchy-surface-rotate daemon
+  omarchy-surface-rotate status|toggle|enable|disable
+  omarchy-surface-rotate normal|left|right|inverted   (turn there and lock)
+  omarchy-surface-rotate sensor      (print what the accelerometer reports)
+"""
+
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import warnings
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+APP = "omarchy-surface-rotate"
+BUS_NAME = "local.omarchy_surface_touch.Rotate"
+BUS_PATH = "/local/omarchy_surface_touch/Rotate"
+BUS_IFACE = "local.omarchy_surface_touch.Rotate1"
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+IIO_DEVICES = "/sys/bus/iio/devices"
+# Omarchy configures Hyprland in Lua, where hyprctl keyword and runtime hl.monitor()
+# calls do not stick: the rotation is a config file of its own, reloaded when it changes
+HYPR_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                         "hypr", "surface-rotate.lua")
+HYPR_RULE = ('-- omarchy-surface-touch: current screen rotation, rewritten by %s\n'
+             'hl.monitor({ output = "%%s", mode = "%%s", position = "%%s", scale = %%s, transform = %%d })\n' % APP)
+# touch and pen only follow the screen when they are turned too
+HYPR_TOUCH_RULE = ('hl.config({ input = { touchdevice = { transform = %d }, '
+                   'tablet = { transform = %d } } })\n')
+
+# Hyprland transform for each orientation
+TRANSFORMS = {"normal": 0, "left": 1, "inverted": 2, "right": 3}
+ORIENTATIONS = list(TRANSFORMS)
+
+DEFAULT_CONFIG = {
+    # display to rotate, empty means the first one Hyprland reports
+    "output": "",
+    # mode, position and scale written next to the rotation; they must match the rest
+    # of your Hyprland monitor configuration
+    "mode": "preferred",
+    "position": "auto",
+    "scale": "auto",
+    # orientations the screen is allowed to take
+    "allow": ORIENTATIONS,
+    # how far the tablet must be tilted out of flat before an edge counts (m/s²)
+    "tilt_threshold": 4.0,
+    # how long an orientation must hold before the screen follows (ms)
+    "settle_ms": 700,
+    # how often the accelerometer is read (ms)
+    "poll_ms": 200,
+    # stop rotating while a physical keyboard is attached
+    "suspend_with_keyboard": True,
+    # keyboards matching this regex (udev name) do not count as physical keyboards
+    "ignore_keyboards": "",
+    # also turn touch and pen input; needed on Hyprland, which only turns the picture
+    "transform_touch": True,
+    # touch transform for each orientation, if touch ends up turned the wrong way
+    "touch_transforms": {"normal": 0, "left": 1, "inverted": 2, "right": 3},
+    # which way the tablet is held for each quarter the accelerometer reports,
+    # in the order [-y down, +x down, +y down, -x down]; measured on a Surface Pro 6,
+    # where +x down means the left edge points up (see README: calibration)
+    "quarters": ["normal", "left", "inverted", "right"],
+}
+
+DEBUG = bool(os.environ.get("ROTATE_DEBUG"))
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        log(msg)
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE) as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"ignoring invalid {CONFIG_FILE}: {e}")
+    config["allow"] = [o for o in config["allow"] if o in TRANSFORMS] or ORIENTATIONS
+    if sorted(config["quarters"]) != sorted(ORIENTATIONS):
+        log(f"ignoring invalid quarters {config['quarters']}")
+        config["quarters"] = DEFAULT_CONFIG["quarters"]
+    return config
+
+
+class Accelerometer:
+    """The iio accel_3d device, read through sysfs."""
+
+    def __init__(self):
+        self.path = self.find()
+        self.scale = self.read_float("in_accel_scale", 1.0)
+
+    @staticmethod
+    def find():
+        try:
+            devices = sorted(os.listdir(IIO_DEVICES))
+        except OSError:
+            return None
+        for device in devices:
+            path = os.path.join(IIO_DEVICES, device)
+            try:
+                with open(os.path.join(path, "name")) as f:
+                    name = f.read().strip()
+            except OSError:
+                continue
+            if name == "accel_3d" and os.path.exists(os.path.join(path, "in_accel_x_raw")):
+                return path
+        return None
+
+    def read_float(self, name, fallback=0.0):
+        try:
+            with open(os.path.join(self.path, name)) as f:
+                return float(f.read().strip())
+        except (OSError, TypeError, ValueError):
+            return fallback
+
+    def read(self):
+        """(x, y, z) in m/s², or None when the sensor is not there."""
+        if not self.path:
+            return None
+        values = [self.read_float(f"in_accel_{axis}_raw", None) for axis in "xyz"]
+        if None in values:
+            return None
+        return tuple(v * self.scale for v in values)
+
+
+def orientation_of(x, y, tilt_threshold, quarters):
+    """How the tablet is held, or None while it lies flat."""
+    if math.hypot(x, y) < tilt_threshold:
+        return None
+    # the axis carrying gravity tells which edge points down
+    if abs(y) >= abs(x):
+        quarter = 0 if y < 0 else 2
+    else:
+        quarter = 1 if x > 0 else 3
+    return quarters[quarter]
+
+
+class PhysicalKeyboards:
+    """Tracks whether a physical keyboard (e.g. the Type Cover) is attached."""
+
+    def __init__(self, ignore_regex, on_change):
+        warnings.filterwarnings("ignore", message="Will be removed in 1.0")
+        import pyudev
+
+        self.ignore = re.compile(ignore_regex) if ignore_regex else None
+        self.on_change = on_change
+        self.context = pyudev.Context()
+        self.present = self.scan()
+        self.monitor = pyudev.Monitor.from_netlink(self.context)
+        self.monitor.filter_by("input")
+        self.monitor.start()
+        GLib.io_add_watch(self.monitor.fileno(), GLib.IO_IN, self.on_udev)
+
+    def scan(self):
+        for device in self.context.list_devices(subsystem="input", ID_INPUT_KEYBOARD="1"):
+            if not (device.device_node or "").startswith("/dev/input/event"):
+                continue
+            name = device.parent.properties.get("NAME", "").strip('"') if device.parent else ""
+            if self.ignore and self.ignore.search(name):
+                continue
+            return True
+        return False
+
+    def on_udev(self, *_):
+        while self.monitor.poll(timeout=0):
+            pass
+        present = self.scan()
+        if present != self.present:
+            self.present = present
+            self.on_change(present)
+        return True
+
+
+class Screen:
+    """The Hyprland output being rotated."""
+
+    def __init__(self, config):
+        self.config = config
+
+    @staticmethod
+    def hypr(args):
+        try:
+            out = subprocess.run(["hyprctl"] + args, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"hyprctl failed: {e}")
+            return None
+        return out.stdout
+
+    def monitor(self):
+        out = self.hypr(["monitors", "-j"])
+        try:
+            monitors = json.loads(out)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        wanted = self.config["output"]
+        for monitor in monitors:
+            if not wanted or monitor.get("name") == wanted:
+                return monitor
+        return None
+
+    def orientation(self):
+        monitor = self.monitor()
+        if not monitor:
+            return None
+        for name, transform in TRANSFORMS.items():
+            if transform == monitor.get("transform"):
+                return name
+        return None
+
+    def rotate(self, orientation):
+        monitor = self.monitor()
+        if not monitor:
+            log("no Hyprland output to rotate")
+            return False
+        transform = TRANSFORMS[orientation]
+        if monitor.get("transform") == transform:
+            return True
+        scale = self.config["scale"]
+        rule = HYPR_RULE % (monitor["name"], self.config["mode"], self.config["position"],
+                            scale if isinstance(scale, (int, float)) else '"%s"' % scale, transform)
+        if self.config["transform_touch"]:
+            touch = self.config["touch_transforms"].get(orientation, transform)
+            rule += HYPR_TOUCH_RULE % (touch, touch)
+        try:
+            os.makedirs(os.path.dirname(HYPR_FILE), exist_ok=True)
+            tmp = HYPR_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(rule)
+            os.replace(tmp, HYPR_FILE)
+        except OSError as e:
+            log(f"cannot write {HYPR_FILE}: {e}")
+            return False
+        self.hypr(["reload", "config-only"])
+        debug(f"rotated to {orientation} (transform {transform})")
+        return True
+
+
+class Control(dbus.service.Object):
+    """Commands from the CLI and the shell plugin."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, BUS_PATH)
+        self.daemon = daemon
+
+    @dbus.service.method(BUS_IFACE, in_signature="s", out_signature="s")
+    def Command(self, command):
+        return self.daemon.command(command)
+
+
+class Daemon:
+    def __init__(self):
+        self.config = load_config()
+        self.bus = dbus.SessionBus()
+        self.accel = Accelerometer()
+        self.screen = Screen(self.config)
+        self.orientation = self.screen.orientation() or "normal"
+        self.candidate = None
+        self.candidate_since = 0
+
+        if not self.accel.path:
+            log("no accel_3d sensor found, rotation stays manual")
+
+        self.physical = (PhysicalKeyboards(self.config["ignore_keyboards"], self.on_physical_keyboard)
+                         if self.config["suspend_with_keyboard"] else None)
+        self.enabled = not (self.physical and self.physical.present)
+
+        self.name = dbus.service.BusName(BUS_NAME, self.bus, do_not_queue=True)
+        self.control = Control(self.bus, self)
+
+        GLib.timeout_add(self.config["poll_ms"], self.poll)
+        self.publish()
+
+    # -- sensor ----------------------------------------------------------------
+
+    def poll(self):
+        if not self.enabled or not self.accel.path:
+            return True
+        reading = self.accel.read()
+        if not reading:
+            return True
+        x, y, _ = reading
+        orientation = orientation_of(x, y, self.config["tilt_threshold"], self.config["quarters"])
+        if orientation is None or orientation not in self.config["allow"]:
+            self.candidate = None
+            return True
+        if orientation != self.candidate:
+            self.candidate = orientation
+            self.candidate_since = GLib.get_monotonic_time() // 1000
+            return True
+        if orientation == self.orientation:
+            return True
+        if GLib.get_monotonic_time() // 1000 - self.candidate_since < self.config["settle_ms"]:
+            return True
+        self.apply(orientation)
+        return True
+
+    def apply(self, orientation):
+        if self.screen.rotate(orientation):
+            self.orientation = orientation
+            self.publish()
+
+    # -- physical keyboard -----------------------------------------------------
+
+    def on_physical_keyboard(self, present):
+        log(f"physical keyboard {'attached' if present else 'detached'}")
+        # laptop mode stops the rotation, tablet mode brings it back
+        self.enabled = not present
+        self.publish()
+
+    # -- commands and state ----------------------------------------------------
+
+    def command(self, command):
+        action = command.strip()
+        if action == "toggle":
+            self.enabled = not self.enabled
+        elif action == "enable":
+            self.enabled = True
+        elif action == "disable":
+            self.enabled = False
+        elif action in TRANSFORMS:
+            self.enabled = False
+            self.candidate = None
+            self.apply(action)
+        elif action != "status":
+            return f"error: unknown command {action}"
+        self.publish()
+        return json.dumps(self.state())
+
+    def state(self):
+        return {
+            "enabled": self.enabled,
+            "orientation": self.orientation,
+            "physicalKeyboard": bool(self.physical and self.physical.present),
+            "sensor": bool(self.accel.path),
+        }
+
+    def publish(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state(), f)
+        os.replace(tmp, STATE_FILE)
+
+
+def run_daemon():
+    DBusGMainLoop(set_as_default=True)
+    try:
+        Daemon()
+    except dbus.exceptions.NameExistsException:
+        sys.exit(f"{APP}: already running")
+    loop = GLib.MainLoop()
+    try:
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except ImportError:
+        signal_add = GLib.unix_signal_add
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    loop.run()
+
+
+def run_command(command):
+    try:
+        proxy = dbus.SessionBus().get_object(BUS_NAME, BUS_PATH)
+        result = proxy.Command(command, dbus_interface=BUS_IFACE)
+    except dbus.DBusException:
+        sys.exit(f"{APP}: the daemon is not running (systemctl --user start {APP})")
+    print(result)
+    sys.exit(1 if result.startswith("error") else 0)
+
+
+def run_sensor():
+    """Print what the accelerometer reports, to check or set the quarters config."""
+    accel = Accelerometer()
+    if not accel.path:
+        sys.exit(f"{APP}: no accel_3d sensor found")
+    config = load_config()
+    print(f"{accel.path} (scale {accel.scale})")
+    while True:
+        reading = accel.read()
+        if reading:
+            x, y, z = reading
+            orientation = orientation_of(x, y, config["tilt_threshold"], config["quarters"])
+            print(f"x={x:+6.2f} y={y:+6.2f} z={z:+6.2f}  -> {orientation or 'flat'}", flush=True)
+        GLib.usleep(200000)
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["daemon"]:
+        run_daemon()
+    elif args == ["sensor"]:
+        run_sensor()
+    elif args and args[0] in ("status", "toggle", "enable", "disable", *ORIENTATIONS):
+        run_command(args[0])
+    else:
+        print(__doc__.strip())
+        sys.exit(0 if args in ([], ["-h"], ["--help"]) else 1)
+
+
+main()

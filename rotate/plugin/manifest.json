@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "surface-touch.rotate",
+  "name": "Screen rotation",
+  "version": "1.0.0",
+  "author": "omarchy-surface-touch",
+  "description": "Bar button for automatic screen rotation: follow the tablet, lock the screen where it is, or go back to landscape.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Screen rotation",
+    "description": "Turns automatic rotation on or off, and back to landscape",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
