@@ -254,6 +254,42 @@ reaches the application underneath. They are a shell plugin, installed in
 
 Remove them with `./gestures/uninstall.sh`.
 
+## Long press as a right click (optional)
+
+A touchscreen has no second button, and Hyprland offers nothing for this: its gestures are trackpad
+only and `input.touchdevice` carries just `enabled`, `output` and `transform`. Outside the
+compositor it would mean reading `/dev/input` and writing to `/dev/uinput`, which needs the `input`
+group — that is, letting every program you run read your keyboard. So `longpress/` is a small
+Hyprland plugin instead, where the touch events already are.
+
+- One finger held still for half a second becomes a right click where the finger rests.
+- Moving more than about 2% of the screen, or putting a second finger down, cancels it, so
+  scrolling, swiping and pinching are untouched.
+
+```bash
+./longpress/install.sh   # as your user, not with sudo
+```
+
+Hyprland passes C++ objects to its plugins and guarantees no ABI stability, so the plugin is
+**built on your machine, against the Hyprland you are running**, and has to be rebuilt when
+Hyprland is updated. The installer takes care of that: it keeps the source next to the build and
+installs a `post-update` hook that rebuilds it after every `omarchy update`, telling you how it
+went. Until it is rebuilt the plugin simply refuses to load (it compares the build hash), so a
+mismatch can never crash the compositor.
+
+The installer changes, for your user only:
+
+| What | Where |
+|---|---|
+| plugin, its source and its build script | `~/.local/lib/omarchy-surface-longpress/` |
+| rebuild after an update | `~/.config/omarchy/hooks/post-update.d/omarchy-surface-longpress` |
+| loading it at startup | `~/.config/hypr/surface-longpress.lua`, one `require` line in `hyprland.lua` |
+
+The delay and the tolerance are `LONG_PRESS_MS` and `MOVE_TOLERANCE` at the top of
+`longpress/src/main.cpp`; change them and run the installer again.
+
+Remove it with `./longpress/uninstall.sh`.
+
 ## Things to know
 
 - **Security.** The IOMMU normally protects memory from buggy or malicious devices. Only the touch
@@ -300,6 +336,7 @@ osk/          optional on-screen keyboard (install.sh, uninstall.sh, daemon, plu
 rotate/       optional screen rotation (install.sh, uninstall.sh, daemon, bar button)
 light/        optional automatic brightness (install.sh, uninstall.sh, daemon, bar button)
 gestures/     optional edge gestures (install.sh, uninstall.sh, shell plugin)
+longpress/    optional long press as a right click (install.sh, uninstall.sh, Hyprland plugin)
 ```
 
 ## Credits and license

@@ -266,6 +266,42 @@ près d'un bord atteint toujours l'application en dessous. C'est un plugin du sh
 
 Désinstallation : `./gestures/uninstall.sh`.
 
+## Appui long = clic droit (optionnel)
+
+Un écran tactile n'a pas de second bouton, et Hyprland n'offre rien pour ça : ses gestes sont
+réservés au pavé tactile et `input.touchdevice` ne connaît que `enabled`, `output` et `transform`.
+En dehors du compositeur, il faudrait lire `/dev/input` et écrire dans `/dev/uinput`, donc
+appartenir au groupe `input` — c'est-à-dire laisser tout programme que tu lances lire ton clavier.
+`longpress/` est donc un petit plugin Hyprland, là où les événements tactiles se trouvent déjà.
+
+- Un doigt maintenu immobile une demi-seconde déclenche un clic droit là où il se trouve.
+- Un déplacement de plus de 2 % de l'écran, ou un deuxième doigt, annule le geste : le défilement,
+  les balayages et le pincement ne changent pas.
+
+```bash
+./longpress/install.sh   # en tant qu'utilisateur, pas avec sudo
+```
+
+Hyprland passe des objets C++ à ses plugins sans garantir la moindre stabilité d'ABI : le plugin est
+donc **compilé sur ta machine, contre le Hyprland que tu utilises**, et doit être recompilé à chaque
+mise à jour de Hyprland. L'installeur s'en charge : il garde la source à côté du binaire et installe
+un hook `post-update` qui recompile après chaque `omarchy update`, en te disant ce qu'il en est. Tant
+qu'il n'est pas recompilé, le plugin refuse simplement de se charger (il compare l'empreinte de
+compilation) : une incompatibilité ne peut donc pas faire tomber le compositeur.
+
+L'installeur modifie, pour ton utilisateur seulement :
+
+| Quoi | Où |
+|---|---|
+| plugin, sa source et son script de compilation | `~/.local/lib/omarchy-surface-longpress/` |
+| recompilation après une mise à jour | `~/.config/omarchy/hooks/post-update.d/omarchy-surface-longpress` |
+| chargement au démarrage | `~/.config/hypr/surface-longpress.lua`, une ligne `require` dans `hyprland.lua` |
+
+Le délai et la tolérance sont `LONG_PRESS_MS` et `MOVE_TOLERANCE` en haut de
+`longpress/src/main.cpp` ; modifie-les et relance l'installeur.
+
+Désinstallation : `./longpress/uninstall.sh`.
+
 ## À savoir
 
 - **Sécurité.** L'IOMMU protège normalement la mémoire contre les périphériques défaillants ou
@@ -315,6 +351,7 @@ osk/          clavier virtuel optionnel (install.sh, uninstall.sh, service, plug
 rotate/       rotation de l'écran optionnelle (install.sh, uninstall.sh, service, bouton de barre)
 light/        luminosité automatique optionnelle (install.sh, uninstall.sh, service, bouton de barre)
 gestures/     gestes de bord optionnels (install.sh, uninstall.sh, plugin du shell)
+longpress/    appui long = clic droit, optionnel (install.sh, uninstall.sh, plugin Hyprland)
 ```
 
 ## Crédits et licence

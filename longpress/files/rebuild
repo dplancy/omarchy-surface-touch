@@ -1,0 +1,21 @@
+#!/bin/bash
+# Rebuild the long-press plugin against the Hyprland installed right now.
+# Run after a Hyprland update; the post-update hook calls this by itself.
+set -uo pipefail
+
+LIB_DIR="$HOME/.local/lib/omarchy-surface-longpress"
+SRC_DIR="$LIB_DIR/src"
+SO="$LIB_DIR/longpress.so"
+
+[[ -d $SRC_DIR ]] || {
+	echo "no sources in $SRC_DIR, reinstall with longpress/install.sh" >&2
+	exit 1
+}
+
+if "$LIB_DIR/build.sh" "$SO"; then
+	notify-send -a "Surface touch" "Long-press plugin rebuilt" "Log out and back in to load it." 2>/dev/null
+else
+	notify-send -u critical -a "Surface touch" "Long-press plugin failed to build" \
+		"Right click by long press stays off until it builds again." 2>/dev/null
+	exit 1
+fi
