@@ -15,6 +15,9 @@ Item {
   property string layout: "azerty"
   property int portraitHeight: 300
   property int landscapeHeight: 280
+  // where the floating icon sits, in pixels from the top left; -1 means bottom right
+  property int iconX: -1
+  property int iconY: -1
 
   function run(args) {
     Quickshell.execDetached([Quickshell.env("HOME") + "/.local/bin/omarchy-surface-osk"].concat(args))
@@ -30,6 +33,8 @@ Item {
       layout = s.layout === "qwerty" ? "qwerty" : "azerty"
       portraitHeight = s.height || 300
       landscapeHeight = s.landscapeHeight || 280
+      iconX = s.iconX === undefined ? -1 : s.iconX
+      iconY = s.iconY === undefined ? -1 : s.iconY
     } catch (e) {
       physicalKeyboard = true
     }

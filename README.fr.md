@@ -94,8 +94,9 @@ Sans le Type Cover, impossible de taper : `osk/` ajoute un clavier à l'écran.
 
 - Quand un champ de texte prend le focus et qu'aucun clavier physique n'est branché, une petite
   icône clavier apparaît en bas à droite. **Touche-la** pour ouvrir ou fermer le clavier,
-  **appuie longuement** pour passer de **AZERTY** à **QWERTY**. Le clavier se ferme quand le champ
-  disparaît.
+  **appuie longuement** pour passer de **AZERTY** à **QWERTY**, et **fais-la glisser** là où elle ne
+  cache rien : sa position est mémorisée, et elle ne passe jamais sous le clavier. Le clavier se
+  ferme quand le champ disparaît.
 - Un bouton clavier dans la barre fait la même chose (clic droit : changer de disposition). Il sert
   pour les applis qui ne signalent pas leurs champs de texte.
 - Sur **l'écran de verrouillage**, le clavier s'ouvre directement pour taper le mot de passe au doigt.
@@ -131,8 +132,10 @@ L'installeur modifie, pour ton utilisateur seulement :
 | les options ajoutées, pour que la désinstallation n'enlève que celles-là | `~/.config/omarchy-surface-osk/added-chromium-flags` |
 
 Réglages dans `~/.config/omarchy-surface-osk/config.json` : `layout`, `height`,
-`landscape_height`, `hide_on_blur`, `ignore_keyboards` (regex des claviers à ignorer).
-Commandes : `omarchy-surface-osk show|hide|toggle|status`, `omarchy-surface-osk layout azerty|qwerty|toggle`.
+`landscape_height`, `hide_on_blur`, `ignore_keyboards` (regex des claviers à ignorer),
+`icon_x` et `icon_y` (dernière position où tu as posé l'icône).
+Commandes : `omarchy-surface-osk show|hide|toggle|status`, `omarchy-surface-osk layout azerty|qwerty|toggle`,
+`omarchy-surface-osk icon <x> <y>` (position de l'icône flottante, `-1 -1` la remet en bas à droite).
 Lancer le service avec `OSK_DEBUG=1` trace les événements de focus et les frappes dans le journal.
 
 À savoir :

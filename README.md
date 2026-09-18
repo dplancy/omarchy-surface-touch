@@ -89,7 +89,9 @@ Without the Type Cover there is no way to type, so `osk/` adds an on-screen keyb
 
 - When a text field gets focus and no physical keyboard is attached, a small keyboard icon
   appears bottom right. **Tap** it to open or close the keyboard, **press and hold** it to switch
-  between **AZERTY** and **QWERTY**. The keyboard closes when the text field goes away.
+  between **AZERTY** and **QWERTY**, and **drag** it wherever it does not cover what you need —
+  where you leave it is remembered, and it never sits under the keyboard itself. The keyboard
+  closes when the text field goes away.
 - A keyboard button in the bar does the same (right click switches the layout). Use it for apps
   that do not report their text fields.
 - On the **lock screen** the keyboard opens directly, so the password can be typed by touch.
@@ -124,8 +126,10 @@ The installer changes, for your user only:
 | the flags it added, so the uninstaller removes only those | `~/.config/omarchy-surface-osk/added-chromium-flags` |
 
 Settings live in `~/.config/omarchy-surface-osk/config.json`: `layout`, `height`,
-`landscape_height`, `hide_on_blur`, `ignore_keyboards` (regex of keyboard names to ignore).
-Commands: `omarchy-surface-osk show|hide|toggle|status`, `omarchy-surface-osk layout azerty|qwerty|toggle`.
+`landscape_height`, `hide_on_blur`, `ignore_keyboards` (regex of keyboard names to ignore),
+`icon_x` and `icon_y` (where you last dragged the icon).
+Commands: `omarchy-surface-osk show|hide|toggle|status`, `omarchy-surface-osk layout azerty|qwerty|toggle`,
+`omarchy-surface-osk icon <x> <y>` (where the floating icon sits, `-1 -1` puts it back bottom right).
 Starting the service with `OSK_DEBUG=1` logs focus events and keystrokes to the journal.
 
 Things to know:

@@ -11,6 +11,7 @@ Usage:
   omarchy-surface-osk daemon
   omarchy-surface-osk show|hide|toggle|status
   omarchy-surface-osk layout [azerty|qwerty|toggle]
+  omarchy-surface-osk icon <x> <y>          (where the floating icon sits)
 """
 
 import json
@@ -60,6 +61,9 @@ DEFAULT_CONFIG = {
     "hide_on_blur": True,
     # keyboards matching this regex (udev name) do not count as physical keyboards
     "ignore_keyboards": "",
+    # where the floating icon sits, in pixels from the top left; -1 puts it bottom right
+    "icon_x": -1,
+    "icon_y": -1,
 }
 
 # fcitx5 sends Hide then Show when focus moves between two fields
@@ -452,6 +456,14 @@ class Daemon:
                 self.arm()
             else:
                 self.keyboard.show()
+        elif action == "icon":
+            if len(args) != 2:
+                return "error: icon needs an x and a y"
+            try:
+                self.config["icon_x"], self.config["icon_y"] = (int(args[0]), int(args[1]))
+            except ValueError:
+                return "error: icon takes two numbers"
+            save_config(self.config)
         elif action == "layout":
             wanted = args[0] if args else "toggle"
             if wanted == "toggle":
@@ -478,6 +490,8 @@ class Daemon:
             "layout": self.config["layout"],
             "height": self.config["height"],
             "landscapeHeight": self.config["landscape_height"],
+            "iconX": self.config["icon_x"],
+            "iconY": self.config["icon_y"],
         }
 
     def publish(self):
@@ -521,7 +535,7 @@ def main():
     args = sys.argv[1:]
     if args == ["daemon"]:
         run_daemon()
-    elif args and args[0] in ("show", "hide", "toggle", "status", "layout"):
+    elif args and args[0] in ("show", "hide", "toggle", "status", "layout", "icon"):
         run_command(" ".join(args))
     else:
         print(__doc__.strip())
