@@ -10,7 +10,9 @@ BarWidget {
 
   OskState { id: osk }
 
-  visible: !osk.physicalKeyboard
+  // the edge gesture can summon the keyboard even with a keyboard attached, and
+  // then this button is the way to put it away again
+  visible: !osk.physicalKeyboard || osk.keyboardVisible
   implicitWidth: visible ? button.implicitWidth : 0
   implicitHeight: button.implicitHeight
 

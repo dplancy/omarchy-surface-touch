@@ -239,8 +239,8 @@ hl.config({
 
 `gestures/` adds the two a tablet misses, as thin strips along the edges:
 
-- **Swipe up from the bottom edge**: open or close the on-screen keyboard. The strip steps aside
-  while the keyboard is up, so it never sits on top of it.
+- **Swipe up from the bottom edge**: call the on-screen keyboard. While it is up the strip rides
+  just above it, and a swipe **down** there puts the keyboard away again.
 - **Swipe down from the top left corner**: open the Omarchy menu.
 
 ```bash

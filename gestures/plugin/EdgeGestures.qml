@@ -15,8 +15,10 @@ Item {
   readonly property int edge: 12
   readonly property int travel: 40
 
-  // the keyboard covers the bottom edge, so the strip steps aside while it is up
+  // the keyboard covers the bottom edge, so the strip rides just above it
   property bool keyboardVisible: false
+  property int keyboardHeight: 300
+  property int keyboardLandscapeHeight: 280
 
   function osk(args) {
     Quickshell.execDetached([Quickshell.env("HOME") + "/.local/bin/omarchy-surface-osk"].concat(args))
@@ -30,7 +32,10 @@ Item {
     onFileChanged: reload()
     onLoaded: {
       try {
-        root.keyboardVisible = JSON.parse(text()).visible === true
+        var s = JSON.parse(text())
+        root.keyboardVisible = s.visible === true
+        root.keyboardHeight = s.height || 300
+        root.keyboardLandscapeHeight = s.landscapeHeight || 280
       } catch (e) {
         root.keyboardVisible = false
       }
@@ -48,10 +53,12 @@ Item {
 
   PanelWindow {
     id: bottom
-    // while the keyboard is up it covers this edge, and its own buttons close it
-    visible: !root.keyboardVisible
     anchors { bottom: true; left: true; right: true }
     implicitHeight: root.edge
+    // sit on top of the keyboard while it is up, so the same edge can close it again
+    margins.bottom: root.keyboardVisible
+      ? (screen && screen.width > screen.height ? root.keyboardLandscapeHeight : root.keyboardHeight)
+      : 0
     color: "transparent"
     WlrLayershell.namespace: "omarchy-surface-gestures"
     WlrLayershell.layer: WlrLayer.Overlay
@@ -64,9 +71,10 @@ Item {
 
       onPressed: function(mouse) { startY = mouse.y }
       onReleased: function(mouse) {
-        // upwards is negative: a swipe up opens or closes the keyboard
-        if (startY - mouse.y > root.travel)
-          root.osk(["toggle"])
+        // swipe up to call the keyboard, swipe down (from above it) to put it away
+        var travelled = root.keyboardVisible ? mouse.y - startY : startY - mouse.y
+        if (travelled > root.travel)
+          root.osk([root.keyboardVisible ? "hide" : "show"])
       }
     }
   }

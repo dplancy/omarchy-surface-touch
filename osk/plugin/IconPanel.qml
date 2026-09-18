@@ -11,7 +11,7 @@ Item {
 
   OskState { id: osk }
 
-  readonly property bool shown: !osk.physicalKeyboard && !osk.locked && (osk.focused || osk.keyboardVisible)
+  readonly property bool shown: !osk.locked && (osk.keyboardVisible || (!osk.physicalKeyboard && osk.focused))
   readonly property int iconSize: Style.space(52)
   readonly property int margin: Style.space(16)
 

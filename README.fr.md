@@ -251,8 +251,8 @@ hl.config({
 `gestures/` ajoute les deux qui manquent sur une tablette, sous forme de fines bandes le long des
 bords :
 
-- **Glisser vers le haut depuis le bord bas** : ouvre ou ferme le clavier virtuel. La bande
-  s'efface quand le clavier est ouvert, elle ne se retrouve donc jamais par-dessus.
+- **Glisser vers le haut depuis le bord bas** : appelle le clavier virtuel. Quand il est ouvert, la
+  bande se place juste au-dessus : un glissement vers le **bas** le referme.
 - **Glisser vers le bas depuis le coin haut gauche** : ouvre le menu Omarchy.
 
 ```bash
