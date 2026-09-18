@@ -8,7 +8,9 @@
 // One finger held still for LONG_PRESS_MS becomes a right click where the
 // finger rests. Moving further than MOVE_TOLERANCE (a fraction of the screen)
 // or putting a second finger down cancels it, so scrolling and pinching are
-// untouched.
+// untouched, and a press on a layer surface (the bar, the on-screen keyboard
+// and its floating icon) is left alone, so holding a key to repeat it does not
+// turn into a right click.
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/event/EventBus.hpp>
@@ -46,6 +48,11 @@ static void disarm() {
 
 static void rightClickAtFinger() {
     if (!g_pInputManager || !g_pSeatManager || !Pointer::mgr())
+        return;
+
+    // the finger is on the bar, the on-screen keyboard, the floating icon or another
+    // layer surface: those are buttons and keys, not places to open a context menu
+    if (!g_pInputManager->m_touchData.touchFocusLS.expired())
         return;
 
     const auto  POS    = g_pInputManager->m_touchData.lastTouchPos;

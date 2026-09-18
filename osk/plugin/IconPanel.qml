@@ -93,6 +93,7 @@ Item {
         anchors.fill: parent
         pressAndHoldInterval: 600
         property bool held: false
+        property bool moved: false
 
         drag.target: button
         drag.threshold: Style.space(8)
@@ -101,7 +102,12 @@ Item {
         drag.minimumY: root.margin
         drag.maximumY: Math.max(root.margin, window.height - root.keyboardHeight - button.height - root.margin)
 
-        onPressed: held = false
+        onPressed: {
+          held = false
+          moved = false
+        }
+
+        onPositionChanged: if (drag.active) moved = true
 
         onPressAndHold: {
           if (drag.active)
@@ -111,7 +117,7 @@ Item {
         }
 
         onReleased: {
-          if (drag.active || button.x !== root.restX || button.y !== root.restY)
+          if (moved)
             osk.run(["icon", Math.round(button.x), Math.round(button.y)])
           else if (!held)
             osk.run(["toggle"])
