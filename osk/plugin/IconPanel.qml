@@ -8,6 +8,11 @@ import qs.Commons
 // close the keyboard. Press and hold: switch between AZERTY and QWERTY. Drag it
 // anywhere, so it never sits on top of something you need; where you leave it
 // is remembered.
+//
+// The window covers the whole screen and only the icon takes touches (`mask`),
+// so dragging happens in a frame that does not move: moving the window itself
+// under the finger makes every event arrive in a different coordinate system,
+// and the icon jumps around.
 Item {
   id: root
 
@@ -16,7 +21,6 @@ Item {
   readonly property bool shown: !osk.locked && (osk.keyboardVisible || (!osk.physicalKeyboard && osk.focused))
   readonly property int iconSize: Style.space(52)
   readonly property int margin: Style.space(16)
-  readonly property int size: iconSize + margin
 
   readonly property int screenWidth: window.screen ? window.screen.width : 1368
   readonly property int screenHeight: window.screen ? window.screen.height : 912
@@ -24,43 +28,43 @@ Item {
     ? (screenWidth > screenHeight ? osk.landscapeHeight : osk.portraitHeight)
     : 0
 
-  // the position being dragged right now, -1 when the finger is not on it
-  property int dragX: -1
-  property int dragY: -1
-
   function clamp(value, low, high) {
     return Math.max(low, Math.min(high, value))
   }
 
-  readonly property int posX: clamp(dragX >= 0 ? dragX : (osk.iconX >= 0 ? osk.iconX : screenWidth - size),
-                                    0, Math.max(0, screenWidth - size))
-  // never let the icon end up under the keyboard
-  readonly property int posY: clamp(dragY >= 0 ? dragY : (osk.iconY >= 0 ? osk.iconY : screenHeight - size),
-                                    0, Math.max(0, screenHeight - keyboardHeight - size))
+  // where the icon rests: what was dragged last time, or the bottom right corner
+  readonly property int restX: clamp(osk.iconX >= 0 ? osk.iconX : screenWidth - iconSize - margin,
+                                     margin, Math.max(margin, screenWidth - iconSize - margin))
+  // never let it end up under the keyboard, where it could not be reached
+  readonly property int restY: clamp(osk.iconY >= 0 ? osk.iconY : screenHeight - iconSize - margin,
+                                     margin, Math.max(margin, screenHeight - keyboardHeight - iconSize - margin))
 
   PanelWindow {
     id: window
     visible: root.shown
-    anchors { top: true; left: true }
-    implicitWidth: root.size
-    implicitHeight: root.size
-    margins { left: root.posX; top: root.posY }
+    anchors { top: true; left: true; right: true; bottom: true }
     color: "transparent"
     WlrLayershell.namespace: "omarchy-surface-osk-icon"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
+    // everything outside the icon stays with the application underneath
+    mask: Region { item: button }
 
     Rectangle {
       id: button
       width: root.iconSize
       height: root.iconSize
-      anchors.left: parent.left
-      anchors.top: parent.top
+      x: root.restX
+      y: root.restY
       radius: width / 2
       color: mouse.pressed ? Color.accent : Util.alpha(Color.background, 0.85)
       border.width: Math.max(1, Style.space(2))
       border.color: Util.alpha(Color.accent, 0.8)
+
+      // dragging writes x and y directly, so the binding is put back afterwards
+      Binding { target: button; property: "x"; value: root.restX; when: !mouse.drag.active; restoreMode: Binding.RestoreNone }
+      Binding { target: button; property: "y"; value: root.restY; when: !mouse.drag.active; restoreMode: Binding.RestoreNone }
 
       Text {
         anchors.centerIn: parent
@@ -89,40 +93,28 @@ Item {
         anchors.fill: parent
         pressAndHoldInterval: 600
         property bool held: false
-        property bool dragging: false
-        property real grabX: 0
-        property real grabY: 0
 
-        onPressed: function(event) {
-          held = false
-          dragging = false
-          // where inside the icon the finger landed, so it stays under the finger
-          grabX = event.x
-          grabY = event.y
-        }
+        drag.target: button
+        drag.threshold: Style.space(8)
+        drag.minimumX: root.margin
+        drag.maximumX: Math.max(root.margin, window.width - button.width - root.margin)
+        drag.minimumY: root.margin
+        drag.maximumY: Math.max(root.margin, window.height - root.keyboardHeight - button.height - root.margin)
 
-        onPositionChanged: function(event) {
-          if (!dragging && Math.abs(event.x - grabX) < Style.space(8) && Math.abs(event.y - grabY) < Style.space(8))
-            return
-          dragging = true
-          root.dragX = root.posX + event.x - grabX
-          root.dragY = root.posY + event.y - grabY
-        }
-
-        onReleased: {
-          if (dragging) {
-            osk.run(["icon", root.posX, root.posY])
-            root.dragX = -1
-            root.dragY = -1
-          } else if (!held)
-            osk.run(["toggle"])
-        }
+        onPressed: held = false
 
         onPressAndHold: {
-          if (dragging)
+          if (drag.active)
             return
           held = true
           osk.run(["layout", "toggle"])
+        }
+
+        onReleased: {
+          if (drag.active || button.x !== root.restX || button.y !== root.restY)
+            osk.run(["icon", Math.round(button.x), Math.round(button.y)])
+          else if (!held)
+            osk.run(["toggle"])
         }
       }
     }
